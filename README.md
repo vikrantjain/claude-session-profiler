@@ -57,6 +57,13 @@ Start Claude Code and work as usual. The session telemetry will be collected in 
 claude plugin add https://github.com/vikrantjain/claude-session-profiler
 ```
 
+Or clone and install locally:
+
+```bash
+git clone git@github.com:vikrantjain/claude-session-profiler.git
+claude plugin add /path/to/claude-session-profiler
+```
+
 ### 5. Configure the ClickHouse connection
 
 On first use, the profiler will ask for your ClickHouse HTTP REST API URL including host and port (e.g. `http://localhost:8123` for a local ClickStack setup).
