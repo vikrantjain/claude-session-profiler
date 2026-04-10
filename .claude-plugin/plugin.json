@@ -1,0 +1,9 @@
+{
+  "name": "claude-session-profiler",
+  "version": "0.1.0",
+  "description": "Profile and analyze Claude Code session telemetry from ClickStack (ClickHouse). Produces detailed analysis covering token/cost breakdown, tool usage, permission friction, subagent assessment, and optimization recommendations.",
+  "author": {
+    "name": "Vikrant Jain"
+  },
+  "keywords": ["telemetry", "observability", "profiling", "clickhouse", "optimization"]
+}
