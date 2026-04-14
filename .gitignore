@@ -1,0 +1,5 @@
+# Generated session analysis reports
+session-reports/
+
+# Per-project ClickHouse connection config (contains local URLs)
+.claude/claude-profiler.local.md
