@@ -91,14 +91,18 @@ Group by `prompt.id` — each prompt becomes a labeled block.
 
 ### 4.X <Recommendation Title>
 **Based on:** Finding 3.X
-**Category:** <Permission / Prompt strategy / Subagent strategy / Configuration / Workflow>
+**Category:** <Permission / Prompt quality / Subagent strategy / Configuration / Workflow>
 **Impact:** <high / medium / low> — <estimated savings>
 
 **What to change:**
-<Specific, actionable. Not "use better prompts" but "specify file path and section for edits.">
+<Specific, actionable. Not "use better prompts" but "specify file path and section for edits."
+For Prompt quality findings: quote the original prompt, show a rewritten version with the specifics the agent
+eventually discovered, and estimate the token/round-trip savings.>
 
 **Reasoning:**
-<Why this addresses the finding. Restate assumptions so user sees them in context.>
+<Why this addresses the finding. Restate assumptions so user sees them in context.
+For Prompt quality findings: note what context the user likely had vs. what they omitted,
+and whether the agent's exploration pattern confirms the prompt was the root cause.>
 
 ## 5. Summary Table
 

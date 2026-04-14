@@ -4,12 +4,13 @@ disable-model-invocation: true
 description: >
   Profile and analyze Claude Code session telemetry from ClickStack (ClickHouse).
   Produces a detailed analysis document covering token/cost breakdown, tool usage,
-  permission friction, subagent assessment, and optimization recommendations.
+  permission friction, prompt quality assessment, subagent assessment, and optimization
+  recommendations — including how user prompts contributed to inefficiency.
 ---
 
 # Claude Session Profiler
 
-You profile Claude Code telemetry stored in ClickStack (ClickHouse) to understand session behavior and identify optimization opportunities for reducing token usage, round-trips, and costs. You produce a detailed analysis document that traces every recommendation back to specific telemetry evidence, states your reasoning and confidence level, and flags assumptions — so the user can validate your conclusions and provide corrections that improve future analysis.
+You profile Claude Code telemetry stored in ClickStack (ClickHouse) to understand session behavior and identify optimization opportunities for reducing token usage, round-trips, and costs. This includes evaluating how user prompts and requirements contributed to session efficiency — whether vague prompts drove unnecessary exploration, compound requests prevented parallelism, or missing context forced the agent to search for what the user already knew. You produce a detailed analysis document that traces every recommendation back to specific telemetry evidence, states your reasoning and confidence level, and flags assumptions — so the user can validate your conclusions and provide corrections that improve future analysis.
 
 ## Connection
 
@@ -310,6 +311,59 @@ FORMAT PrettyCompact
 
 This gives you the cost and activity breakdown per interaction (prompt). Map each prompt to what the user asked and how much work it generated.
 
+**Prompt quality assessment (when `OTEL_LOG_USER_PROMPTS=1` is active):**
+
+If Step 0 confirmed prompt text is available, enrich the interaction flow with a prompt effectiveness analysis. This isn't a separate step — it's understanding *why* each interaction cost what it did, which is inseparable from understanding the interaction flow itself.
+
+Pull full prompt text for all user prompts (excluding subagent task-notifications):
+
+```sql
+SELECT
+  LogAttributes['prompt.id'] AS prompt_id,
+  LogAttributes['prompt'] AS prompt_text,
+  length(LogAttributes['prompt']) AS prompt_length,
+  Timestamp
+FROM otel_logs
+WHERE ServiceName = 'claude-code'
+  AND LogAttributes['session.id'] = '<SESSION_ID>'
+  AND Body = 'claude_code.user_prompt'
+  AND LogAttributes['prompt'] NOT LIKE '%<task-notification>%'
+ORDER BY Timestamp
+FORMAT PrettyCompact
+```
+
+Also pull the per-prompt tool breakdown to see the search-vs-action split for each interaction:
+
+```sql
+SELECT
+  LogAttributes['prompt.id'] AS prompt_id,
+  countIf(LogAttributes['tool_name'] IN ('Grep', 'Glob')) AS search_calls,
+  countIf(LogAttributes['tool_name'] = 'Read') AS read_calls,
+  countIf(LogAttributes['tool_name'] IN ('Edit', 'Write')) AS edit_calls,
+  countIf(LogAttributes['tool_name'] = 'Bash') AS bash_calls,
+  countIf(Body = 'claude_code.api_request') AS llm_calls,
+  sum(toFloat64OrZero(LogAttributes['cost_usd'])) AS cost_usd
+FROM otel_logs
+WHERE ServiceName = 'claude-code'
+  AND LogAttributes['session.id'] = '<SESSION_ID>'
+  AND Body IN ('claude_code.tool_result', 'claude_code.api_request')
+  AND LogAttributes['prompt.id'] != ''
+GROUP BY prompt_id
+ORDER BY search_calls DESC
+FORMAT PrettyCompact
+```
+
+Cross-reference the prompt text with the cost/activity data from the per-prompt query above. For each interaction, you now have: what the user said, how much the agent spent, and how the agent allocated that effort between searching and acting. This data feeds directly into Step 5's problem identification — when Step 5 flags an expensive interaction, the prompt text and search-vs-action ratio are the first place to look for the root cause.
+
+**What to capture per interaction for Step 5:**
+- Prompt specificity: does it name files, functions, error messages, or is it abstract?
+- Prompt scope: bounded ("update retry logic in `client.ts`") vs open-ended ("make the API more robust")?
+- Search-to-action ratio: high search calls relative to edits suggests the agent had to discover what the prompt could have specified
+- Correction patterns: sequential prompts where later ones narrow scope or redirect ("fix the tests" → "the auth tests" → "specifically `test_login_flow`")
+- Compound requests: a single prompt that generated work across unrelated code areas
+
+Don't interpret these patterns here — just collect and annotate the interaction flow data. Step 5 uses this to trace problems to their root cause.
+
 **(traces) Interaction sequence with span-level prompts:**
 
 ```sql
@@ -452,9 +506,29 @@ FORMAT PrettyCompact
 
 Look for: rate limit errors (status 429), server errors (5xx), retries (`attempt` > 1), and errors concentrated in specific prompts. API errors add latency and can cause the model to retry or change approach.
 
-**Too many LLM round-trips per interaction:**
-- Simple tasks (file edit, single question) should need 2-3 LLM calls
-- More than 5 calls for a simple task indicates the model is hesitating or the prompt was vague
+**Too many LLM round-trips per interaction — trace to root cause:**
+
+Simple tasks (file edit, single question) should need 2-3 LLM calls. More than 5 calls for a simple task indicates a problem — but the problem has different root causes that require different recommendations. Use the prompt text and search-vs-action data collected in Step 3 to distinguish:
+
+- *Vague or underspecified prompt* — The prompt lacked specifics (no file paths, function names, or error messages) and the agent spent most of its round-trips on search calls (high search-to-action ratio from Step 3). The user likely had context they didn't provide. **Recommendation category: Prompt quality** — suggest a rewritten prompt that includes the specifics the agent eventually discovered, with an estimate of the savings.
+
+- *Overly broad scope* — The prompt was open-ended ("make the API more robust", "improve test coverage") forcing the agent to decide *what* to do before *how* to do it. This shows up as high LLM calls with many different tool targets across unrelated directories. **Recommendation category: Prompt quality** — suggest breaking into bounded subtasks or providing acceptance criteria.
+
+- *Compound request* — A single prompt contained multiple unrelated tasks ("fix the auth bug and also update the README and add a test for the billing module"). The agent handled them sequentially when they could have been separate prompts or parallel subagents. Cross-reference `tool_input` file paths — if they span unrelated directories within one prompt, check if the prompt text contained multiple requests. **Recommendation category: Prompt quality** — suggest splitting into separate prompts or explicit subagent delegation.
+
+- *Correction/redirection across prompts* — Sequential prompts where the user progressively narrows scope: "fix the tests" → "the auth tests" → "specifically `test_login_flow`". Each redirect wasted the agent's prior exploration. **Recommendation category: Prompt quality** — show the escalating sequence and suggest the final, specific version as the starting point.
+
+- *Agent hesitation (not a prompt issue)* — The prompt was specific enough but the agent still took many round-trips, visible as read-after-write patterns, low-output-token LLM calls, or repeated searches with slight variations. **Recommendation category: Workflow/Configuration** — this is a model behavior issue, not a user prompt issue.
+
+When prompt text is not available (no `OTEL_LOG_USER_PROMPTS=1`), you can still detect the structural patterns (search-heavy prompts, correction sequences, compound work) — but you can't confirm whether the prompt itself was the root cause. Note this limitation and present findings as "likely prompt-related" at lower confidence.
+
+For each prompt-quality finding, generate a concrete rewritten prompt that includes the specifics the agent eventually discovered — but only information the user likely had at the time. Estimate the impact: "Providing the file path directly would have eliminated ~N search calls and ~M LLM rounds, saving ~Xk input tokens (~$Y)."
+
+**What NOT to flag as a prompt quality issue:**
+- Prompts for genuinely exploratory tasks ("help me understand how the auth system works") — exploration is the point
+- Short conversational follow-ups ("yes", "looks good", "go ahead") — normal interaction
+- Prompts where the agent was efficient despite brevity — a short prompt that led to 2 LLM calls and 1 edit is fine
+- Users working in unfamiliar codebases — if the user couldn't have known the file paths, the exploration was necessary
 
 **High permission friction:**
 - Tools with many blocked decisions (from the permission friction query in Step 2)
@@ -564,7 +638,7 @@ When no subagents were used (or few were), look for telemetry patterns that sugg
 
 **Important:** these are heuristic recommendations based on structural patterns, not certainties. Telemetry shows *what* happened (tool calls, token counts, timing) but not *why*. Always present subagent recommendations as "likely opportunities" with your reasoning, and ask the user to confirm — they have the context you don't.
 
-Run this query to detect sequential search/explore patterns within a single prompt:
+Use the per-prompt tool breakdown from Step 3 as a starting point. Run this additional query to add input token growth, which Step 3 doesn't capture:
 
 ```sql
 SELECT
