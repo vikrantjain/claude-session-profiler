@@ -33,10 +33,10 @@ curl -s --get "<CLICKHOUSE_URL>/" --data-urlencode "query=<SQL>"
 
 Analysis depth depends on what telemetry was enabled. Step 0 detects the level automatically. These environment variables can be set however the user prefers — shell profile, project-level env file, direnv, etc. Full documentation: https://code.claude.com/docs/en/monitoring-usage
 
-Key flags that unlock deeper analysis (each builds on the previous):
-- `OTEL_LOG_USER_PROMPTS=1` + `OTEL_LOG_TOOL_DETAILS=1` → user prompt text, tool input JSON, result sizes (minimum for meaningful profiling)
-- `CLAUDE_CODE_ENHANCED_TELEMETRY_BETA=1` + `OTEL_TRACES_EXPORTER=otlp` → span hierarchy, execution vs permission time breakdown
-- `OTEL_LOG_TOOL_CONTENT=1` → full tool I/O content in trace spans (60KB limit, generates significant data)
+Key flags that unlock deeper analysis (each level builds on the previous):
+- **Level 1** (basic): No detail flags — you get event names, token counts, cost, and timing, but no prompt text or tool input details
+- **Level 2** (recommended minimum): `OTEL_LOG_USER_PROMPTS=1` + `OTEL_LOG_TOOL_DETAILS=1` → user prompt text, tool input JSON, result sizes
+- **Level 3** (full): Level 2 + `CLAUDE_CODE_ENHANCED_TELEMETRY_BETA=1` + `OTEL_TRACES_EXPORTER=otlp` → span hierarchy, execution vs permission time breakdown. Optionally `OTEL_LOG_TOOL_CONTENT=1` → full tool I/O content in trace spans (60KB limit, generates significant data)
 
 If the session had incomplete configuration, note what's missing in the report and recommend upgrading.
 
@@ -328,7 +328,7 @@ WHERE ServiceName = 'claude-code'
   AND LogAttributes['session.id'] = '<SESSION_ID>'
   AND Body = 'claude_code.user_prompt'
   AND LogAttributes['prompt'] NOT LIKE '%<task-notification>%'
-ORDER BY Timestamp
+ORDER BY Timestamp, toUInt32OrZero(LogAttributes['event.sequence'])
 FORMAT PrettyCompact
 ```
 
@@ -424,7 +424,7 @@ WHERE ServiceName = 'claude-code'
   AND LogAttributes['session.id'] = '<SESSION_ID>'
   AND Body = 'claude_code.user_prompt'
   AND LogAttributes['prompt'] LIKE '%<task-notification>%'
-ORDER BY Timestamp
+ORDER BY Timestamp, toUInt32OrZero(LogAttributes['event.sequence'])
 FORMAT PrettyCompact
 ```
 
@@ -466,7 +466,7 @@ FROM otel_logs
 WHERE ServiceName = 'claude-code'
   AND LogAttributes['session.id'] = '<SESSION_ID>'
   AND LogAttributes['prompt.id'] IN ('<SPAWN_PROMPT_ID>', '<COMPLETION_PROMPT_ID_1>', '<COMPLETION_PROMPT_ID_2>')
-ORDER BY toUInt32OrZero(seq)
+ORDER BY Timestamp, toUInt32OrZero(seq)
 FORMAT PrettyCompact
 ```
 
@@ -500,7 +500,7 @@ FROM otel_logs
 WHERE ServiceName = 'claude-code'
   AND LogAttributes['session.id'] = '<SESSION_ID>'
   AND Body = 'claude_code.api_error'
-ORDER BY Timestamp
+ORDER BY Timestamp, toUInt32OrZero(LogAttributes['event.sequence'])
 FORMAT PrettyCompact
 ```
 
@@ -520,6 +520,8 @@ Simple tasks (file edit, single question) should need 2-3 LLM calls. More than 5
 
 - *Agent hesitation (not a prompt issue)* — The prompt was specific enough but the agent still took many round-trips, visible as read-after-write patterns, low-output-token LLM calls, or repeated searches with slight variations. **Recommendation category: Workflow/Configuration** — this is a model behavior issue, not a user prompt issue.
 
+- *Behavioral contradiction after user rejection* — The user explicitly rejected an approach (e.g., via ExitPlanMode or a correction prompt), but the agent continued or fell back to the rejected approach. Detect this by cross-referencing `tool_input` commands after a rejection event against the rejected plan's content — e.g., if the user rejected a Python plan and the agent later runs `which python3` or `python3 --version`, that's the agent ignoring the user's stated preference. **Recommendation category: Workflow** — note the contradiction and the wasted round-trips, and suggest specifying the preferred approach in CLAUDE.md to prevent recurrence.
+
 When prompt text is not available (no `OTEL_LOG_USER_PROMPTS=1`), you can still detect the structural patterns (search-heavy prompts, correction sequences, compound work) — but you can't confirm whether the prompt itself was the root cause. Note this limitation and present findings as "likely prompt-related" at lower confidence.
 
 For each prompt-quality finding, generate a concrete rewritten prompt that includes the specifics the agent eventually discovered — but only information the user likely had at the time. Estimate the impact: "Providing the file path directly would have eliminated ~N search calls and ~M LLM rounds, saving ~Xk input tokens (~$Y)."
@@ -533,7 +535,32 @@ For each prompt-quality finding, generate a concrete rewritten prompt that inclu
 **High permission friction:**
 - Tools with many blocked decisions (from the permission friction query in Step 2)
 - With traces: tools with high `avg_blocked_ms` or many `times_blocked`
+- Without traces: use the temporal gap analysis below — large gaps after `tool_decision` events estimate permission wait time from logs alone
 - Recommend adding specific allow rules for frequently approved tools
+
+**Bash failure analysis:**
+
+When Step 2 shows a non-trivial Bash failure count, query `tool_input` to understand *what* failed and categorize the failures:
+
+```sql
+SELECT
+  LogAttributes['prompt.id'] AS prompt_id,
+  LogAttributes['event.sequence'] AS seq,
+  JSONExtractString(LogAttributes['tool_input'], 'command') AS command,
+  LogAttributes['tool_parameters'] AS params,
+  toUInt64OrZero(LogAttributes['duration_ms']) AS duration_ms,
+  Timestamp
+FROM otel_logs
+WHERE ServiceName = 'claude-code'
+  AND LogAttributes['session.id'] = '<SESSION_ID>'
+  AND Body = 'claude_code.tool_result'
+  AND LogAttributes['tool_name'] = 'Bash'
+  AND LogAttributes['success'] = 'false'
+ORDER BY Timestamp, toUInt32OrZero(LogAttributes['event.sequence'])
+FORMAT PrettyCompact
+```
+
+Group failures by category (environment probing, installation attempts, test failures, build errors, etc.) and note which prompts they concentrate in. A cluster of related failures often reveals a cascade — e.g., "no runtime installed → wrong install method → incompatible dependency → full rewrite." Identifying the root of the cascade is more useful than listing individual failures.
 
 **Slow tool executions:**
 - Tools with high `avg_duration_ms` or `max_duration_ms` (from the tool usage query in Step 2)
@@ -548,13 +575,16 @@ SELECT
   a.LogAttributes['event.sequence'] AS edit1_seq,
   b.LogAttributes['event.sequence'] AS read_seq,
   c.LogAttributes['event.sequence'] AS edit2_seq,
+  a.LogAttributes['prompt.id'] AS prompt_id,
   JSONExtractString(a.LogAttributes['tool_input'], 'file_path') AS file_path
 FROM otel_logs a
 JOIN otel_logs b ON b.LogAttributes['session.id'] = a.LogAttributes['session.id']
+  AND b.LogAttributes['prompt.id'] = a.LogAttributes['prompt.id']
   AND b.Body = 'claude_code.tool_result'
   AND b.LogAttributes['tool_name'] = 'Read'
   AND toUInt32OrZero(b.LogAttributes['event.sequence']) > toUInt32OrZero(a.LogAttributes['event.sequence'])
 JOIN otel_logs c ON c.LogAttributes['session.id'] = a.LogAttributes['session.id']
+  AND c.LogAttributes['prompt.id'] = a.LogAttributes['prompt.id']
   AND c.Body = 'claude_code.tool_result'
   AND c.LogAttributes['tool_name'] = 'Edit'
   AND toUInt32OrZero(c.LogAttributes['event.sequence']) > toUInt32OrZero(b.LogAttributes['event.sequence'])
@@ -568,7 +598,7 @@ WHERE a.ServiceName = 'claude-code'
 FORMAT PrettyCompact
 ```
 
-The sequence gap filter (`<= 6`) keeps it focused on tight Edit→Read→Edit patterns rather than matching unrelated edits far apart.
+The `prompt.id` constraint ensures matches are within the same interaction — an Edit in prompt 1 followed by a Read in prompt 2 is context loss across prompts, not read-after-write hesitation. The sequence gap filter (`<= 6`) keeps it focused on tight patterns rather than matching unrelated edits far apart.
 
 **Low output token calls:**
 
@@ -585,11 +615,69 @@ WHERE ServiceName = 'claude-code'
   AND LogAttributes['session.id'] = '<SESSION_ID>'
   AND Body = 'claude_code.api_request'
   AND toUInt64OrZero(LogAttributes['output_tokens']) < 50
-ORDER BY toUInt32OrZero(seq)
+ORDER BY Timestamp, toUInt32OrZero(seq)
 FORMAT PrettyCompact
 ```
 
 Multiple consecutive low-output calls within the same `prompt.id` suggest the model is breaking work into too many steps.
+
+**Context growth per prompt:**
+
+For any prompt with more than 10 LLM calls, check how context size grows across calls — this reveals whether tool results are accumulating and inflating cost:
+
+```sql
+SELECT
+  LogAttributes['event.sequence'] AS seq,
+  toUInt64OrZero(LogAttributes['input_tokens']) AS input_tokens,
+  toUInt64OrZero(LogAttributes['cache_read_tokens']) AS cache_read,
+  toUInt64OrZero(LogAttributes['cache_creation_tokens']) AS cache_created,
+  toUInt64OrZero(LogAttributes['output_tokens']) AS output_tokens,
+  LogAttributes['model'] AS model
+FROM otel_logs
+WHERE ServiceName = 'claude-code'
+  AND LogAttributes['session.id'] = '<SESSION_ID>'
+  AND Body = 'claude_code.api_request'
+  AND LogAttributes['prompt.id'] = '<EXPENSIVE_PROMPT_ID>'
+ORDER BY Timestamp, toUInt32OrZero(seq)
+FORMAT PrettyCompact
+```
+
+Track `cache_read` growth across the calls. If it doubles or more within a single prompt (e.g., 49k → 97k), each additional LLM call is re-reading a growing context — a sign that the prompt could benefit from staged splitting or subagent delegation. Report the start and end values and the growth percentage in the finding.
+
+**Temporal gap analysis:**
+
+Large time gaps between consecutive events within a session reveal idle time, long permission waits, or network issues that don't show up in aggregate stats. Use a window function to find pauses over 10 seconds:
+
+```sql
+SELECT
+  seq, next_seq, event, next_event, tool,
+  dateDiff('second', ts, next_ts) AS gap_seconds
+FROM (
+  SELECT
+    LogAttributes['event.sequence'] AS seq,
+    leadInFrame(LogAttributes['event.sequence']) OVER w AS next_seq,
+    Body AS event,
+    leadInFrame(Body) OVER w AS next_event,
+    LogAttributes['tool_name'] AS tool,
+    Timestamp AS ts,
+    leadInFrame(Timestamp) OVER w AS next_ts
+  FROM otel_logs
+  WHERE ServiceName = 'claude-code'
+    AND LogAttributes['session.id'] = '<SESSION_ID>'
+  WINDOW w AS (ORDER BY Timestamp, toUInt32OrZero(LogAttributes['event.sequence']) ROWS BETWEEN CURRENT ROW AND 1 FOLLOWING)
+)
+WHERE gap_seconds > 10
+ORDER BY ts
+FORMAT PrettyCompact
+```
+
+Interpret the gaps based on the surrounding events:
+- Gap after `tool_decision` → likely permission wait (user was prompted and took time to respond)
+- Gap after `api_request` with a subsequent `api_error` → possible rate limit backoff or server issue
+- Gap after `user_prompt` → user was thinking or stepped away; this is idle time, not agent inefficiency
+- Gap between `tool_result` and the next `api_request` → possible network latency or framework overhead
+
+Large gaps (minutes) between a `tool_decision` and the next event are strong signals for permission friction — without traces, this is the best way to detect permission wait time from logs alone. Sum these gaps to estimate total time the session spent blocked on user input vs actively working.
 
 **Bloated initial context:**
 
@@ -605,7 +693,7 @@ FROM otel_logs
 WHERE ServiceName = 'claude-code'
   AND LogAttributes['session.id'] = '<SESSION_ID>'
   AND Body = 'claude_code.api_request'
-ORDER BY toUInt32OrZero(seq)
+ORDER BY Timestamp, toUInt32OrZero(seq)
 LIMIT 3
 FORMAT PrettyCompact
 ```
@@ -643,10 +731,11 @@ Use the per-prompt tool breakdown from Step 3 as a starting point. Run this addi
 ```sql
 SELECT
   LogAttributes['prompt.id'] AS prompt_id,
-  countIf(LogAttributes['tool_name'] IN ('Grep', 'Glob', 'Read', 'Bash')) AS search_tool_calls,
+  countIf(Body = 'claude_code.tool_result' AND LogAttributes['tool_name'] IN ('Grep', 'Glob', 'Read', 'Bash')) AS search_tool_calls,
   countIf(Body = 'claude_code.api_request') AS llm_calls,
   sum(toUInt64OrZero(LogAttributes['input_tokens'])) AS total_input_tokens,
-  max(toUInt64OrZero(LogAttributes['input_tokens'])) - min(toUInt64OrZero(LogAttributes['input_tokens'])) AS input_token_growth
+  maxIf(toUInt64OrZero(LogAttributes['input_tokens']), Body = 'claude_code.api_request')
+    - minIf(toUInt64OrZero(LogAttributes['input_tokens']), Body = 'claude_code.api_request' AND toUInt64OrZero(LogAttributes['input_tokens']) > 0) AS input_token_growth
 FROM otel_logs
 WHERE ServiceName = 'claude-code'
   AND LogAttributes['session.id'] = '<SESSION_ID>'
@@ -673,7 +762,7 @@ WHERE ServiceName = 'claude-code'
   AND LogAttributes['session.id'] = '<SESSION_ID>'
   AND Body = 'claude_code.api_request'
   AND LogAttributes['prompt.id'] = '<CANDIDATE_PROMPT_ID>'
-ORDER BY toUInt32OrZero(seq)
+ORDER BY Timestamp, toUInt32OrZero(seq)
 FORMAT PrettyCompact
 ```
 
@@ -725,6 +814,7 @@ WHERE ServiceName = 'claude-code'
   AND LogAttributes['session.id'] = '<SESSION_ID>'
   AND Body = 'claude_code.tool_result'
   AND LogAttributes['tool_name'] IN ('Read', 'Edit', 'Write', 'Glob', 'Grep')
+ORDER BY Timestamp, toUInt32OrZero(LogAttributes['event.sequence'])
 LIMIT 20
 FORMAT PrettyCompact
 ```
@@ -733,7 +823,7 @@ Extract the common root path — that's the project directory. If you can read f
 
 **Inspect based on telemetry findings:**
 
-*If high `cache_creation_tokens` on first LLM call (Step 1):*
+*If high `cache_creation_tokens` on first LLM call (Step 5):*
 
 The initial context is built from CLAUDE.md, memory files, permissions, and loaded skills. Inspect what's contributing:
 

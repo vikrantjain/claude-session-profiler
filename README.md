@@ -113,44 +113,44 @@ Here's a sample diagram from a real profiled session (a Claude Code task to buil
 ```mermaid
 sequenceDiagram
     participant User
-    participant Agent
+    participant Claude
     participant Tools
     participant Subagent
 
     Note over User,Tools: Prompt 1 — "Implement requirements.md" ($0.54, 8.5 min)
-    User ->> Agent: Can you implement the requirement documented in @requirements.md
-    Agent ->> Subagent: Explore /demo-app (directory doesn't exist — wasted)
-    Subagent -->> Agent: Nothing found
-    Agent ->> Subagent: Plan #1 — design REST API
-    Subagent -->> Agent: Plan proposed (non-Node.js stack)
-    Note over Agent,Tools: ❌ User rejects plan
-    Agent ->> Subagent: Plan #2 — design Node.js REST API
-    Subagent -->> Agent: Plan accepted
-    Agent ->> Tools: Bash x7 (mkdir, npm init — 4 failures, no Node.js)
-    Agent ->> Tools: AskUserQuestion — "Node.js not available"
+    User ->> Claude: Can you implement the requirement documented in @requirements.md
+    Claude ->> Subagent: Explore /demo-app (directory doesn't exist — wasted)
+    Subagent -->> Claude: Nothing found
+    Claude ->> Subagent: Plan #1 — design REST API
+    Subagent -->> Claude: Plan proposed (non-Node.js stack)
+    Note over Claude,Tools: ❌ User rejects plan
+    Claude ->> Subagent: Plan #2 — design Node.js REST API
+    Subagent -->> Claude: Plan accepted
+    Claude ->> Tools: Bash x7 (mkdir, npm init — 4 failures, no Node.js)
+    Claude ->> Tools: AskUserQuestion — "Node.js not available"
 
     Note over User,Tools: Prompt 2 — "why don't you install nodejs" ($0.66, 7.6 min)
-    User ->> Agent: why don't you install nodejs
-    Agent ->> Tools: Bash (NodeSource setup — failed)
-    Agent ->> Tools: Bash (curl node v20 .tar.xz — wrong format)
-    Agent ->> Tools: Bash (curl node v20 .tar.gz — success)
-    Agent ->> Tools: Bash (npm install — 18.5s)
-    Agent ->> Tools: Write x14 (all source files, one per LLM round)
-    Agent ->> Tools: Bash (npm test — failed, Node v20 too old)
-    Agent ->> Tools: Bash (install Node v22)
-    Agent ->> Tools: Bash (npm test — failed, vitest incompatible)
-    Note over Agent,Tools: ❌ Switches framework: vitest → node:test
-    Agent ->> Tools: Write x5 (rewrite ALL test files)
-    Agent ->> Tools: Bash (npm test — still failing) x3
-    Agent ->> Tools: Edit x3 (fix service, middleware, schema bugs)
-    Agent ->> Tools: Bash (npm test — 29 tests pass) ✓
+    User ->> Claude: why don't you install nodejs
+    Claude ->> Tools: Bash (NodeSource setup — failed)
+    Claude ->> Tools: Bash (curl node v20 .tar.xz — wrong format)
+    Claude ->> Tools: Bash (curl node v20 .tar.gz — success)
+    Claude ->> Tools: Bash (npm install — 18.5s)
+    Claude ->> Tools: Write x14 (all source files, one per LLM round)
+    Claude ->> Tools: Bash (npm test — failed, Node v20 too old)
+    Claude ->> Tools: Bash (install Node v22)
+    Claude ->> Tools: Bash (npm test — failed, vitest incompatible)
+    Note over Claude,Tools: ❌ Switches framework: vitest → node:test
+    Claude ->> Tools: Write x5 (rewrite ALL test files)
+    Claude ->> Tools: Bash (npm test — still failing) x3
+    Claude ->> Tools: Edit x3 (fix service, middleware, schema bugs)
+    Claude ->> Tools: Bash (npm test — 29 tests pass) ✓
 
     Note over User,Tools: Prompt 3 — "Setup via README.MD" ($0.21, 2.3 min)
-    User ->> Agent: Anybody should be able to setup and use the project after going through README.MD
-    Agent ->> Tools: Read + Edit README x3
+    User ->> Claude: Anybody should be able to setup and use the project after going through README.MD
+    Claude ->> Tools: Read + Edit README x3
 
     Note over User,Tools: Prompt 4 — "Thanks." ($0.01)
-    User ->> Agent: Thanks.
+    User ->> Claude: Thanks.
 ```
 
 Without profiling, this session looked like "it took a while and cost $1.42." With profiling, you can see that a five-word user correction triggered 46% of the total cost, the agent rewrote all test files after choosing the wrong framework, and 33% of Bash calls failed due to environment probing. That level of detail turns vague frustration into targeted fixes.

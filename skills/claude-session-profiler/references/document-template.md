@@ -37,6 +37,7 @@ Group by `prompt.id` — each prompt becomes a labeled block.
 
 **Readability:**
 - Collapse 3+ consecutive same-tool calls: `Tools -->> Claude: <tool_name> x5 (avg <size> bytes)`
+- **Failed tool calls**: don't collapse — show individually with the command from `tool_input` and annotate with "failed" (e.g., `Claude ->> Tools: Bash(curl node v20 .tar.xz — failed)`). Failed calls are the most diagnostic events in the diagram; collapsing them hides the failure cascade.
 - Sessions with 50+ events: detail first/last interaction, summarize middle as a note
 - Subagent spawns: show spawn + completion as async block, don't inline internal events
 
